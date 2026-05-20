@@ -8,6 +8,7 @@ What's new in v3:
   - Copy engine: fires orders to all active followers on every TRADED signal
   - Copy results broadcast to frontend in real-time
   - Settings API: max lots, slippage, index filter, exchange filter
+  - Debug logging for Dhan auth responses
 """
 
 import asyncio
@@ -40,7 +41,6 @@ LOT_SIZES = {"NIFTY": 50, "BANKNIFTY": 15, "FINNIFTY": 40, "SENSEX": 10, "BANKEX
 
 # ── Global State ──────────────────────────────────────────────────────────────
 class AppState:
-    # Dhan master WS
     dhan_ws = None
     status: str = "DISCONNECTED"
     client_id: str = ""
@@ -48,16 +48,13 @@ class AppState:
     copy_count: int = 0
     last_order_ts: Optional[str] = None
     _task: Optional[asyncio.Task] = None
-    # Browser clients
     frontend_clients: set = set()
-    # Follower registry: dict keyed by follower id
     followers: dict = {}
-    # Settings
     settings: dict = {
         "max_lots": 5,
         "copy_trigger": "TRADED",
-        "exchange_filter": "BOTH",     # BOTH / NSE / BSE
-        "index_filter": "ALL",          # ALL / NIFTY / BANKNIFTY / FINNIFTY / SENSEX / BANKEX
+        "exchange_filter": "BOTH",
+        "index_filter": "ALL",
         "order_type": "MARKET",
         "stop_mirror": True,
         "pause_on_dd": False,
@@ -75,7 +72,7 @@ class ConnectRequest(BaseModel):
 class FollowerRequest(BaseModel):
     id: str
     name: str
-    broker: str                         # dhan / zerodha / angel / upstox
+    broker: str
     client_id: str
     lots: int = 1
     active: bool = True
@@ -83,14 +80,13 @@ class FollowerRequest(BaseModel):
     billing: str = "free"
     sub_fee: float = 0
     comm_pct: float = 0
-    # Credentials (broker-specific)
     access_token: str = ""
-    api_key: str = ""                   # Zerodha / Angel
-    angel_jwt_token: str = ""           # Angel One JWT
-    angel_client_code: str = ""         # Angel One client code
-    dhan_security_id: str = ""          # Dhan scrip security ID (per instrument)
-    angel_symbol_token: str = ""        # Angel scrip token (per instrument)
-    upstox_instrument_key: str = ""     # Upstox instrument key (per instrument)
+    api_key: str = ""
+    angel_jwt_token: str = ""
+    angel_client_code: str = ""
+    dhan_security_id: str = ""
+    angel_symbol_token: str = ""
+    upstox_instrument_key: str = ""
 
 class SettingsRequest(BaseModel):
     max_lots: Optional[int] = None
@@ -124,7 +120,6 @@ async def set_status(new_status: str, detail: str = ""):
     await broadcast({"type": "status", "status": new_status, "detail": detail, "ts": ist_now()})
 
 def parse_dhan_order(msg: dict) -> Optional[dict]:
-    """Extract and normalise fields from a Dhan order_alert message."""
     try:
         d = msg.get("Data", {})
         sym = (d.get("Symbol") or "").upper()
@@ -144,7 +139,7 @@ def parse_dhan_order(msg: dict) -> Optional[dict]:
         return {
             "id":          d.get("OrderNo") or d.get("ExchOrderNo") or f"ORD-{int(datetime.now().timestamp())}",
             "exchOrderNo": d.get("ExchOrderNo"),
-            "securityId":  d.get("SecurityId", ""),   # passed to Dhan follower orders
+            "securityId":  d.get("SecurityId", ""),
             "index":       index,
             "symbol":      d.get("Symbol", sym),
             "exchange":    d.get("Exchange", "NSE"),
@@ -165,7 +160,6 @@ def parse_dhan_order(msg: dict) -> Optional[dict]:
         return None
 
 def should_copy(trade: dict) -> bool:
-    """Apply settings filters to decide if this trade should be copied."""
     s = state.settings
     if s["exchange_filter"] != "BOTH" and trade.get("exchange") != s["exchange_filter"]:
         return False
@@ -174,7 +168,6 @@ def should_copy(trade: dict) -> bool:
     return True
 
 def eligible_followers(trade: dict) -> list:
-    """Return followers that are active and interested in this index."""
     result = []
     for f in state.followers.values():
         if not f.get("active"):
@@ -182,7 +175,6 @@ def eligible_followers(trade: dict) -> list:
         tags = f.get("tags", [])
         if tags and trade.get("index") not in tags:
             continue
-        # Cap lots at settings max
         f_copy = dict(f)
         f_copy["lots"] = min(f.get("lots", 1), state.settings["max_lots"])
         result.append(f_copy)
@@ -195,6 +187,7 @@ async def dhan_loop(client_id: str, access_token: str):
     while retry < 20:
         try:
             await set_status("CONNECTING")
+            log.info(f"Connecting to Dhan WS (attempt {retry + 1}) client_id={client_id[:6]}...")
             async with websockets.connect(
                 DHAN_WS_URL, ping_interval=20, ping_timeout=10, close_timeout=5
             ) as ws:
@@ -202,34 +195,38 @@ async def dhan_loop(client_id: str, access_token: str):
                 retry = 0
 
                 await set_status("AUTHENTICATING")
-                await ws.send(json.dumps({
+                auth_payload = {
                     "LoginReq": {"MsgCode": 42, "ClientId": client_id, "Token": access_token},
                     "UserType": "SELF",
-                }))
+                }
+                log.info(f"Sending auth payload for client {client_id}")
+                await ws.send(json.dumps(auth_payload))
 
-		async for raw in ws:
-    		    try:
-        		msg = json.loads(raw)
-        		log.info(f"Dhan message: {raw[:200]}")
-		    except Exception:
-        		continue
+                async for raw in ws:
+                    # Log every raw message from Dhan for debugging
+                    log.info(f"Dhan raw message: {raw[:300]}")
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
 
                     t = msg.get("Type", "")
+                    log.info(f"Dhan message type: '{t}'  keys: {list(msg.keys())}")
 
                     if t == "connection" or msg.get("MsgCode") == 43:
                         await set_status("CONNECTED", f"Client {client_id}")
+                        log.info("Dhan WS authenticated successfully!")
                         continue
 
-		    if t == "auth_failed" or msg.get("status") == "failed":
-    			await set_status("AUTH_FAILED", f"Dhan rejected: {json.dumps(msg)}")
-    			log.error(f"Dhan auth response: {json.dumps(msg)}")
-    			return
+                    if t == "auth_failed" or msg.get("status") == "failed":
+                        log.error(f"Dhan auth FAILED. Full response: {json.dumps(msg)}")
+                        await set_status("AUTH_FAILED", f"Dhan rejected auth: {msg.get('remarks', msg.get('message', 'Unknown reason'))}")
+                        return
 
                     if t == "order_alert":
                         d = msg.get("Data", {})
                         seg = d.get("Segment", "")
                         opt = d.get("OptType", "")
-                        # Only NSE FNO (D) and BSE FNO (F) options
                         if seg not in ("D", "F") or opt not in ("CE", "PE"):
                             continue
 
@@ -242,7 +239,6 @@ async def dhan_loop(client_id: str, access_token: str):
 
                         log.info(f"#{state.order_count} {trade['side']} {trade['symbol']} {trade['status']}")
 
-                        # Forward raw signal to frontend
                         await broadcast({
                             "type": "order_alert",
                             "data": msg,
@@ -251,36 +247,36 @@ async def dhan_loop(client_id: str, access_token: str):
                             "count": state.order_count,
                         })
 
-                        # ── COPY ENGINE ──────────────────────────────────────
                         if trade["status"] == "TRADED" and should_copy(trade):
                             followers = eligible_followers(trade)
                             if followers:
-                                log.info(f"Copying {trade['symbol']} → {len(followers)} followers")
+                                log.info(f"Copying {trade['symbol']} to {len(followers)} followers")
                                 asyncio.create_task(
                                     copy_trade_to_all(followers, trade, broadcast)
                                 )
                                 state.copy_count += 1
 
         except websockets.exceptions.ConnectionClosedError as e:
+            log.error(f"WS closed: code={e.code} reason={e.reason}")
             if e.code == 805:
                 await set_status("MAX_CONN", "Max 5 WS connections on Dhan")
                 return
-            await set_status("DISCONNECTED")
+            await set_status("DISCONNECTED", f"Closed: {e.code}")
         except Exception as e:
-            log.error(f"WS error: {e}")
+            log.error(f"WS error: {type(e).__name__}: {e}")
             await set_status("ERROR", str(e))
         finally:
             state.dhan_ws = None
 
         delay = min(2 ** (retry + 1), 30)
-        log.info(f"Reconnecting in {delay}s…")
+        log.info(f"Reconnecting in {delay}s...")
         await broadcast({"type": "reconnecting", "delay": delay, "ts": ist_now()})
         await asyncio.sleep(delay)
         retry += 1
 
     await set_status("ERROR", "Max retries exhausted")
 
-# ── Startup: auto-connect if env vars set ─────────────────────────────────────
+# ── Startup ───────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
@@ -291,7 +287,7 @@ async def startup():
         state.client_id = cid
         state._task = asyncio.create_task(dhan_loop(cid, tok))
 
-# ── REST — Master connection ──────────────────────────────────────────────────
+# ── REST API ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health():
@@ -313,7 +309,7 @@ async def connect(req: ConnectRequest):
     state.client_id = req.client_id
     state.order_count = 0
     state._task = asyncio.create_task(dhan_loop(req.client_id, req.access_token))
-    return {"ok": True, "message": "Connecting…"}
+    return {"ok": True, "message": "Connecting..."}
 
 @app.post("/api/disconnect")
 async def disconnect_route():
@@ -333,11 +329,8 @@ def get_status():
         "last_order": state.last_order_ts,
     }
 
-# ── REST — Follower management ────────────────────────────────────────────────
-
 @app.get("/api/followers")
 def list_followers():
-    # Return followers but mask sensitive credentials
     safe = []
     for f in state.followers.values():
         fc = dict(f)
@@ -358,7 +351,6 @@ async def add_follower(req: FollowerRequest):
 async def update_follower(follower_id: str, req: FollowerRequest):
     if follower_id not in state.followers:
         return JSONResponse({"ok": False, "message": "Follower not found"}, status_code=404)
-    # Preserve existing credentials if not provided in update
     existing = state.followers[follower_id]
     updated  = req.dict()
     for cred_key in ("access_token","api_key","angel_jwt_token","angel_client_code"):
@@ -388,8 +380,6 @@ async def toggle_follower(follower_id: str):
     await broadcast({"type": "follower_toggled", "follower_id": follower_id, "active": f["active"], "ts": ist_now()})
     return {"ok": True, "active": f["active"]}
 
-# ── REST — Settings ───────────────────────────────────────────────────────────
-
 @app.get("/api/settings")
 def get_settings():
     return {"ok": True, "settings": state.settings}
@@ -402,15 +392,11 @@ async def update_settings(req: SettingsRequest):
     await broadcast({"type": "settings_updated", "settings": state.settings, "ts": ist_now()})
     return {"ok": True, "settings": state.settings}
 
-# ── Browser WebSocket ─────────────────────────────────────────────────────────
-
 @app.websocket("/ws")
 async def frontend_ws(websocket: WebSocket):
     await websocket.accept()
     state.frontend_clients.add(websocket)
     log.info(f"Browser connected (total: {len(state.frontend_clients)})")
-
-    # Send full current state on connect
     await websocket.send_text(json.dumps({
         "type": "init",
         "status": state.status,
@@ -419,7 +405,6 @@ async def frontend_ws(websocket: WebSocket):
         "settings": state.settings,
         "ts": ist_now(),
     }))
-
     try:
         while True:
             data = await websocket.receive_text()
