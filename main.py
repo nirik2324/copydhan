@@ -206,9 +206,6 @@ async def dhan_loop(client_id: str, access_token: str):
                 DHAN_WS_URL,
                 ping_interval=None,
                 close_timeout=5,
-                additional_headers={
-                    "Origin": "https://web.dhan.co",
-                }
             ) as ws:
                 state.dhan_ws = ws
                 retry = 0
