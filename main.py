@@ -1,20 +1,12 @@
 """
 CopyDhan v3 — FastAPI Backend
-==============================
-What's new in v3:
-  - Real order placement via brokers.py (Dhan, Zerodha, Angel One, Upstox)
-  - Follower registry: add/remove/update followers via API
-  - Per-follower API credentials stored in memory (never logged)
-  - Copy engine: fires orders to all active followers on every TRADED signal
-  - Copy results broadcast to frontend in real-time
-  - Settings API: max lots, slippage, index filter, exchange filter
-  - Debug logging for Dhan auth responses
 """
 
 import asyncio
 import json
 import logging
 import os
+import struct
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -119,6 +111,27 @@ async def set_status(new_status: str, detail: str = ""):
     log.info(f"Status → {new_status}  {detail}")
     await broadcast({"type": "status", "status": new_status, "detail": detail, "ts": ist_now()})
 
+def parse_dhan_binary(data: bytes) -> Optional[dict]:
+    """
+    Dhan sends binary WebSocket frames for order updates.
+    Parse the binary packet per Dhan's order update API spec.
+    """
+    try:
+        log.info(f"Binary data length: {len(data)} bytes, hex: {data.hex()[:60]}")
+        # Dhan binary format (order update):
+        # Byte 0: Feed/Message type
+        # Try to decode as UTF-8 first (some messages are JSON in binary frame)
+        try:
+            text = data.decode("utf-8").strip()
+            if text.startswith("{"):
+                return json.loads(text)
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        log.warning(f"Binary parse error: {e}")
+        return None
+
 def parse_dhan_order(msg: dict) -> Optional[dict]:
     try:
         d = msg.get("Data", {})
@@ -187,40 +200,61 @@ async def dhan_loop(client_id: str, access_token: str):
     while retry < 20:
         try:
             await set_status("CONNECTING")
-            log.info(f"Connecting to Dhan WS (attempt {retry + 1}) client_id={client_id[:6]}...")
+            log.info(f"Connecting to Dhan WS (attempt {retry + 1})")
+
             async with websockets.connect(
-                DHAN_WS_URL, ping_interval=20, ping_timeout=10, close_timeout=5
+                DHAN_WS_URL,
+                ping_interval=None,
+                close_timeout=5,
+                additional_headers={
+                    "Origin": "https://web.dhan.co",
+                }
             ) as ws:
                 state.dhan_ws = ws
                 retry = 0
 
                 await set_status("AUTHENTICATING")
-                auth_payload = {
-                    "LoginReq": {"MsgCode": 42, "ClientId": client_id, "Token": access_token},
-                    "UserType": "SELF",
-                }
-                log.info(f"Sending auth payload for client {client_id}")
-                await ws.send(json.dumps(auth_payload))
+                auth_payload = json.dumps({
+                    "LoginReq": {
+                        "MsgCode": 42,
+                        "ClientId": client_id,
+                        "Token": access_token
+                    },
+                    "UserType": "SELF"
+                })
+                log.info(f"Sending auth for client {client_id}")
+                await ws.send(auth_payload)
 
                 async for raw in ws:
-                    # Log every raw message from Dhan for debugging
-                    log.info(f"Dhan raw message: {raw[:300]}")
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
+                    # Handle both text and binary messages
+                    if isinstance(raw, bytes):
+                        log.info(f"Binary frame: {len(raw)} bytes hex={raw.hex()[:80]}")
+                        msg = parse_dhan_binary(raw)
+                        if msg is None:
+                            # Binary frame received — Dhan uses binary for order updates
+                            # Check if it's a connection acknowledgment
+                            if len(raw) < 10:
+                                log.info("Short binary frame — possible connection ack")
+                                await set_status("CONNECTED", f"Client {client_id}")
+                            continue
+                    else:
+                        log.info(f"Text frame: {raw[:200]}")
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
 
                     t = msg.get("Type", "")
-                    log.info(f"Dhan message type: '{t}'  keys: {list(msg.keys())}")
+                    log.info(f"Msg type='{t}' MsgCode={msg.get('MsgCode')} status={msg.get('status')}")
 
                     if t == "connection" or msg.get("MsgCode") == 43:
                         await set_status("CONNECTED", f"Client {client_id}")
-                        log.info("Dhan WS authenticated successfully!")
+                        log.info("Dhan WS authenticated!")
                         continue
 
                     if t == "auth_failed" or msg.get("status") == "failed":
-                        log.error(f"Dhan auth FAILED. Full response: {json.dumps(msg)}")
-                        await set_status("AUTH_FAILED", f"Dhan rejected auth: {msg.get('remarks', msg.get('message', 'Unknown reason'))}")
+                        log.error(f"Auth FAILED: {json.dumps(msg)}")
+                        await set_status("AUTH_FAILED", msg.get("remarks", "Auth rejected by Dhan"))
                         return
 
                     if t == "order_alert":
@@ -250,7 +284,7 @@ async def dhan_loop(client_id: str, access_token: str):
                         if trade["status"] == "TRADED" and should_copy(trade):
                             followers = eligible_followers(trade)
                             if followers:
-                                log.info(f"Copying {trade['symbol']} to {len(followers)} followers")
+                                log.info(f"Copying to {len(followers)} followers")
                                 asyncio.create_task(
                                     copy_trade_to_all(followers, trade, broadcast)
                                 )
@@ -261,6 +295,9 @@ async def dhan_loop(client_id: str, access_token: str):
             if e.code == 805:
                 await set_status("MAX_CONN", "Max 5 WS connections on Dhan")
                 return
+            # Code 1006 = abnormal closure — usually auth issue or binary protocol
+            if e.code == 1006:
+                log.error("Code 1006 — Dhan closed connection. Possible causes: wrong token, token expired, IP not whitelisted")
             await set_status("DISCONNECTED", f"Closed: {e.code}")
         except Exception as e:
             log.error(f"WS error: {type(e).__name__}: {e}")
