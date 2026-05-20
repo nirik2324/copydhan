@@ -207,11 +207,12 @@ async def dhan_loop(client_id: str, access_token: str):
                     "UserType": "SELF",
                 }))
 
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
+		async for raw in ws:
+    		    try:
+        		msg = json.loads(raw)
+        		log.info(f"Dhan message: {raw[:200]}")
+		    except Exception:
+        		continue
 
                     t = msg.get("Type", "")
 
@@ -219,9 +220,10 @@ async def dhan_loop(client_id: str, access_token: str):
                         await set_status("CONNECTED", f"Client {client_id}")
                         continue
 
-                    if t == "auth_failed" or msg.get("status") == "failed":
-                        await set_status("AUTH_FAILED", "Invalid credentials")
-                        return
+		    if t == "auth_failed" or msg.get("status") == "failed":
+    			await set_status("AUTH_FAILED", f"Dhan rejected: {json.dumps(msg)}")
+    			log.error(f"Dhan auth response: {json.dumps(msg)}")
+    			return
 
                     if t == "order_alert":
                         d = msg.get("Data", {})
